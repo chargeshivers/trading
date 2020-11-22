@@ -1,10 +1,37 @@
-import iexfinance.stocks as xf
+#import iexfinance.stocks as xf
 import pandas as pd
 import numpy as np
 import os
 import scipy.stats as sp
 import datetime as dt
 import heapq
+from config import client_id
+import requests
+from collections import defaultdict
+
+quote = lambda s : requests.get(url=f'https://api.tdameritrade.com/v1/marketdata/{s}/quotes?',
+                    params={'apikey' : client_id}).json().get(s, defaultdict(int))
+
+extract = lambda d : { k.split(':')[0] : ','.join(   [i[-2:] == '.0' and i[:-2] or i for i in  v.keys()] )   for k,v in d.items() } 
+chains = lambda s,t: extract(requests.get(url=f'https://api.tdameritrade.com/v1/marketdata/chains',
+                    params={'apikey' : client_id
+                           , 'symbol': s
+                            , 'contractType' : t
+                            #, 'fromDate' :
+                            #, 'toDate' :'2021-01-31'
+                            #, 'strikeCount' : 2
+                            
+                           }).json()[f'{t.lower()}ExpDateMap'])
+
+floor = lambda b : lambda x : (x//b)*b
+nearest = lambda b : lambda x : floor(b)(x) + (b if x - floor(b)(x) >= b/2 else 0)
+def backr(spread, target= None, buy= 1, edge= None, disc= 0.5, prem= 0.05, fee= 0.02):
+    assert target or edge , "target or edge needs to be specified"
+    assert buy in [-1,1] , "buy has to be +1 or -1"
+    t = target if target else edge*(1+disc)**(-buy) # np.exp( - buy * np.log(1+disc) )
+    z = nearest(spread)(t*(1+buy*prem))
+    return sorted([z + buy*2*spread, z+buy*spread, buy*(z-t), fee+ buy*(z-t) ], reverse = True)
+
 
 class StockPrices:
     data = {}
@@ -12,36 +39,24 @@ class StockPrices:
     
     @classmethod
     def get(self, stock, lookback_window= 250):
+        nullReplace = lambda x: x if x else ss["latestPrice"]
         if stock not in self.data:
-            print(f"updating stock info for {stock}")
-            ss = xf.Stock(stock).get_quote()
+            #print(f"updating stock info for {stock}")
+            #ss = xf.Stock(stock).get_quote()
+            ss = quote(stock)
+            
             self.data[stock] = {}
-            self.data[stock]["current"] = ss['latestPrice']
-            self.data[stock]["last_min"] = ss["low"]
-            self.data[stock]["last_max"] = ss["high"]
-            self.data[stock]["52weekHigh"] = ss['week52High']
-            self.data[stock]["52weekLow"] = ss['week52Low']
+            self.data[stock]["current"] = ss['lastPrice']#ss['latestPrice']
+            nullReplace = lambda x: x if x else ss["lastPrice"]
+            self.data[stock]["last_min"] = ss['lowPrice'] #nullReplace(ss["low"])
+            self.data[stock]["last_max"] = ss['highPrice'] #nullReplace(ss["high"])
+            self.data[stock]["52weekHigh"] = ss['52WkHigh'] #ss['week52High']
+            self.data[stock]["52weekLow"] = ss['52WkLow'] #ss['week52Low']
                 
             self.data[stock]["rSigma"] = {}
-            try:
-                df = xf.get_historical_data(stock, end= dt.datetime.today(), start= dt.datetime.today() + dt.timedelta(-365), output_format = "pandas" )
-                
-                decay = 0.01**(1/lookback_window)
-                
-                df = df.reset_index()
-                df['log_ret_min'] = np.log(df["low"]) - np.log(df["low"].shift(1))
-                df['log_ret_max'] = np.log(df["high"]) - np.log(df["high"].shift(1))
-                df = df[-lookback_window:]
-                df['maxIndex']=df.index.max()
-                df['weight'] = (decay**(-lookback_window)) * (decay**(df['maxIndex']-df.index))
-                for x in ["min","max"]:
-                    weighted_sample =[ k for k, i in df[ [f"log_ret_{x}", "weight"] ].values for _ in range(int(np.floor(i)))   ] 
-                    self.data[stock]["rSigma"][x] = sp.cauchy.fit( weighted_sample )
-            #except KeyError or ValueError or UnicodeDecodeError or IEXQueryError:
-            except:
-                print(f"unable to get historical data for {stock}")
-                for x in ["min","max"]:
-                    self.data[stock]["rSigma"][x] = ( np.log(ss['latestPrice'])/np.log(ss['previousClose']),0.1)
+
+            for x in ["min","max"]:
+                self.data[stock]["rSigma"][x] = ( np.log(ss['lastPrice'])/np.log(ss['closePrice']),0.1)
 
                 #del self.data[stock]
                 #self.get(self,stock,lookback_window = 250)
@@ -63,8 +78,11 @@ class StockPrices:
     @classmethod
     def FallBelowProb(self,stock,price):
         r , sigma =self.get(stock)["rSigma"]["min"]
-        return sp.cauchy.cdf( (  -r + np.log( price / self.get(stock)["last_min"] )  ) / sigma  )
-        
+        #return sp.cauchy.cdf( (  -r + np.log( price / self.get(stock)["last_min"] )  ) / sigma  )
+        try:
+            return sp.cauchy.cdf( (  -r + np.log( price / self.get(stock)["last_min"] )  ) / sigma  )
+        except ZeroDivisionError:
+            return 1
 
 class Order:
     def __init__(self,stock, price,quantity=0):
@@ -82,7 +100,11 @@ class Order:
     def DistanceFrom52weekHigh(self):
         return round(StockPrices.get(self.stock)["52weekHigh"]/self.price -1,2)
     def PositionIn52weekWindow(self):
-        return round(  (self.price - StockPrices.get(self.stock)["52weekLow"])/(StockPrices.get(self.stock)["52weekHigh"] - StockPrices.get(self.stock)["52weekLow"]),2)    
+        #return round(  (self.price - StockPrices.get(self.stock)["52weekLow"])/(StockPrices.get(self.stock)["52weekHigh"] - StockPrices.get(self.stock)["52weekLow"]),2)
+        try:
+            return round(  (self.price - StockPrices.get(self.stock)["52weekLow"])/(StockPrices.get(self.stock)["52weekHigh"] - StockPrices.get(self.stock)["52weekLow"]),2)
+        except ZeroDivisionError:
+            return 1
     def ExecutionProbability(self, otype = "buy"):
         if otype == "buy":
             return StockPrices.FallBelowProb( self.stock, self.price   )
@@ -116,6 +138,9 @@ class OCOorder(object):
                )
       
 class Position(Order):
+    def __init__(self, stock, price, quantity, target):
+        self.target = (target if target > 0  else price*1.5)
+        Order.__init__(self, stock, price, quantity)
     def Gain(self):
         return StockPrices.get(self.stock)["current"]/self.price -1
 
@@ -124,7 +149,8 @@ class Portfolio:
         if Positions != None:
             self.Positions = Positions
         elif File != None:
-            self.Positions = [ Position(r["stock"], r["cost"], r["quantity"]) for i,r in pd.read_csv(File).iterrows()]
+            #self.Positions = [ Position(r["stock"], r["cost"], r["quantity"]) for i,r in pd.read_csv(File).iterrows()]
+            self.Positions = [ Position(r["stock"], r["cost"], r["quantity"],r["target"]) for i,r in pd.read_csv(File).iterrows()]
         else:
             print("Error")
     def Cost(self):
@@ -142,14 +168,17 @@ class Portfolio:
                               ,"current" : StockPrices.get(p.stock)['current']
                               , "gain" : p.Gain()
                               , "Pos52" : Order(p.stock,p.price).PositionIn52weekWindow()
-                              , "CallStrike" : np.floor(p.price*1.5*0.95)
-                              , "CallPrice" : p.price*1.5 - np.floor(p.price*1.5*0.95)
+                              , "target" : p.target
+                              #, "CallStrike" : np.floor(p.price*1.5*0.95)
+                              #, "CallPrice" : p.price*1.5 - np.floor(p.price*1.5*0.95)
+                              , "CallStrike" : np.floor(p.target*0.95)
+                              , "CallPrice" : p.target - np.floor(p.target*0.95)
                              }    for p in self.Positions ])
         df["concentration"] = df["investment"]/df["investment"].sum()
         print("Total investment = " + "${:,.0f}".format(self.Cost())  )
         print("Total Gain = " + "{:.1%}".format(self.Gain()))
         if not columns:
-            columns = ["stock","cost","Pos52","quantity","investment","concentration","current","gain","CallStrike", "CallPrice"]
+            columns = ["stock","cost","Pos52","quantity","investment","concentration","current","gain","target","CallStrike", "CallPrice"]
         #return df[columns].sort_values(sortby, ascending = ascending)
         display(df[columns].sort_values(sortby, ascending = ascending).style.format({
             "current" : "${:,.2f}"
@@ -158,6 +187,7 @@ class Portfolio:
             ,"gain" : "{:.0%}"
             , "concentration" : "{:.0%}"
             , "Pos52" :"{:.0%}"
+            , "target" : "${:,.2f}"
             , "CallStrike" : "${:,.2f}"
             , "CallPrice" : "${:,.2f}" }).hide_index())
             
@@ -230,7 +260,7 @@ class WishList:
         else:
             print("Error")
         self.sell = sell
-    def DisplayStats(self, sortby = "Xprob", ascending = False):
+    def DisplayStats(self, sortby = "Xprob", ascending = False,columns = ["stock","price","suggPrice","LastMin","LastMax","Xprob","High52","Pos52","suggXprob","putStrike","putPrice"]):
         self.df["LastMin"] = self.df.apply(lambda row :  StockPrices.get(row["stock"])["last_min"], axis =1   )
         self.df["LastMax"] = self.df.apply(lambda row :  StockPrices.get(row["stock"])["last_max"], axis =1   )
         if self.sell:
@@ -244,7 +274,7 @@ class WishList:
         self.df["putStrike"] = self.df.apply(lambda row :  np.ceil(row["price"]*1.05), axis =1   )
         self.df["putPrice"] = self.df.apply(lambda row :  np.ceil(row["price"]*1.05) -  row["price"], axis =1   )
 
-        columns = ["stock","price","LastMin","LastMax","Xprob","High52","Pos52","suggPrice","suggXprob","putStrike","putPrice"]
+        
         #return self.df[columns].sort_values(sortby, ascending = ascending)
  
         display(self.df[columns]
@@ -266,3 +296,23 @@ class WishList:
 def newCost(currentCost, sellPrice, numSold, numCurrent):
     numHeld = numCurrent - numSold
     return currentCost - (sellPrice - currentCost)*numSold/numHeld
+
+"""
+            try:
+                df = xf.get_historical_data(stock, end= dt.datetime.today(), start= dt.datetime.today() + dt.timedelta(-365), output_format = "pandas" )
+                
+                decay = 0.01**(1/lookback_window)
+                
+                df = df.reset_index()
+                df['log_ret_min'] = np.log(df["low"]) - np.log(df["low"].shift(1))
+                df['log_ret_max'] = np.log(df["high"]) - np.log(df["high"].shift(1))
+                df = df[-lookback_window:]
+                df['maxIndex']=df.index.max()
+                df['weight'] = (decay**(-lookback_window)) * (decay**(df['maxIndex']-df.index))
+                for x in ["min","max"]:
+                    weighted_sample =[ k for k, i in df[ [f"log_ret_{x}", "weight"] ].values for _ in range(int(np.floor(i)))   ] 
+                    self.data[stock]["rSigma"][x] = sp.cauchy.fit( weighted_sample )
+            #except KeyError or ValueError or UnicodeDecodeError or IEXQueryError:
+            except:
+                print(f"unable to get historical data for {stock}")
+"""
