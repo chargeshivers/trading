@@ -23,6 +23,18 @@ chains = lambda s,t: extract(requests.get(url=f'https://api.tdameritrade.com/v1/
                             
                            }).json()[f'{t.lower()}ExpDateMap'])
 
+history = lambda s : requests.get(
+    f"https://api.tdameritrade.com/v1/marketdata/{s}/pricehistory"
+    , params = {
+        'apikey': client_id
+        , 'periodType' : 'year'
+        , 'period' : 1
+        , 'frequencyType' : 'daily'
+        , 'frequency' : 1
+    }).json()['candles']
+extremes = lambda e : lambda s : list(map( lambda _:_[e], history(s)  ))
+deltas = lambda xs : (a-b for a,b in zip(xs, xs[1:]))
+
 floor = lambda b : lambda x : (x//b)*b
 nearest = lambda b : lambda x : floor(b)(x) + (b if x - floor(b)(x) >= b/2 else 0)
 def backr(spread, target= None, buy= 1, edge= None, disc= 0.5, prem= 0.05, fee= 0.02):
@@ -55,29 +67,28 @@ class StockPrices:
                 
             self.data[stock]["rSigma"] = {}
 
-            for x in ["min","max"]:
-                self.data[stock]["rSigma"][x] = ( np.log(ss['lastPrice'])/np.log(ss['closePrice']),0.1)
+            for e in ["low","high"]:
+                #self.data[stock]["rSigma"][x] = ( np.log(ss['lastPrice'])/np.log(ss['closePrice']),0.1)
+                self.data[stock]["rSigma"][e] = sp.cauchy.fit( list(deltas( list(map(np.log ,  extremes(e)(stock)[::-1] )) ))  )
 
-                #del self.data[stock]
-                #self.get(self,stock,lookback_window = 250)
         return self.data[stock]
     
     @classmethod
     def PredictedMin(self,stock):
-        return self.get(stock)["last_min"]*np.exp( self.get(stock)["rSigma"]["min"][0]  )
+        return self.get(stock)["last_min"]*np.exp( self.get(stock)["rSigma"]["low"][0]  )
     
     @classmethod
     def PredictedMax(self,stock):
-        return self.get(stock)["last_max"]*np.exp( self.get(stock)["rSigma"]["max"][0]  )   
+        return self.get(stock)["last_max"]*np.exp( self.get(stock)["rSigma"]["high"][0]  )   
     
     @classmethod
     def RiseAboveProb(self,stock,price):
-        r , sigma = self.get(stock)["rSigma"]["max"]
+        r , sigma = self.get(stock)["rSigma"]["high"]
         return 1 - sp.cauchy.cdf( (  -r + np.log( price / self.get(stock)["last_max"] )  ) / sigma  )
     
     @classmethod
     def FallBelowProb(self,stock,price):
-        r , sigma =self.get(stock)["rSigma"]["min"]
+        r , sigma =self.get(stock)["rSigma"]["low"]
         #return sp.cauchy.cdf( (  -r + np.log( price / self.get(stock)["last_min"] )  ) / sigma  )
         try:
             return sp.cauchy.cdf( (  -r + np.log( price / self.get(stock)["last_min"] )  ) / sigma  )
@@ -309,7 +320,7 @@ def newCost(currentCost, sellPrice, numSold, numCurrent):
                 df = df[-lookback_window:]
                 df['maxIndex']=df.index.max()
                 df['weight'] = (decay**(-lookback_window)) * (decay**(df['maxIndex']-df.index))
-                for x in ["min","max"]:
+                for x in ["low","high"]:
                     weighted_sample =[ k for k, i in df[ [f"log_ret_{x}", "weight"] ].values for _ in range(int(np.floor(i)))   ] 
                     self.data[stock]["rSigma"][x] = sp.cauchy.fit( weighted_sample )
             #except KeyError or ValueError or UnicodeDecodeError or IEXQueryError:
