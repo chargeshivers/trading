@@ -1,13 +1,12 @@
-#import iexfinance.stocks as xf
 import pandas as pd
 import numpy as np
-import os
 import scipy.stats as sp
 import datetime as dt
 import heapq
 from config import client_id
 import requests
 from collections import defaultdict
+from IPython.display import display
 
 quote = lambda s : requests.get(url=f'https://api.tdameritrade.com/v1/marketdata/{s}/quotes?',
                     params={'apikey' : client_id}).json().get(s, defaultdict(int))
@@ -17,10 +16,6 @@ chains = lambda s,t: extract(requests.get(url=f'https://api.tdameritrade.com/v1/
                     params={'apikey' : client_id
                            , 'symbol': s
                             , 'contractType' : t
-                            #, 'fromDate' :
-                            #, 'toDate' :'2021-01-31'
-                            #, 'strikeCount' : 2
-                            
                            }).json()[f'{t.lower()}ExpDateMap'])
 
 history = lambda s : requests.get(
@@ -53,8 +48,6 @@ class StockPrices:
     def get(self, stock, lookback_window= 250):
         nullReplace = lambda x: x if x else ss["latestPrice"]
         if stock not in self.data:
-            #print(f"updating stock info for {stock}")
-            #ss = xf.Stock(stock).get_quote()
             ss = quote(stock)
             
             self.data[stock] = {}
@@ -68,7 +61,6 @@ class StockPrices:
             self.data[stock]["rSigma"] = {}
 
             for e in ["low","high"]:
-                #self.data[stock]["rSigma"][x] = ( np.log(ss['lastPrice'])/np.log(ss['closePrice']),0.1)
                 self.data[stock]["rSigma"][e] = sp.cauchy.fit( list(deltas( list(map(np.log ,  extremes(e)(stock)[::-1] )) ))  )
 
         return self.data[stock]
