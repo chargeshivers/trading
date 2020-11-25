@@ -48,7 +48,7 @@ def backr_suggest(stock, buy, target):
     return {k: next(
         filter(
             lambda _: set(_[:2]).issubset(set(map(float, v.split(','))))
-            , map(partial(backr, buy=buy, target=target), (0.5 * _ for _ in range(1, 21)))))
+            , map(partial(backr, buy=buy, target=target), (0.5 * _ for _ in range(1, 21)))), None)
         for k, v in chains(stock, 'PUT' if buy == 1 else 'CALL').items()}
 
 
@@ -58,23 +58,11 @@ class StockPrices:
 
     @classmethod
     def get(self, stock, lookback_window=250):
-        #nullReplace = lambda x: x if x else ss["latestPrice"]
         if stock not in self.data:
-            ss = quote(stock)
-
-            self.data[stock] = {}
-            self.data[stock]["current"] = ss['lastPrice']  # ss['latestPrice']
-            #nullReplace = lambda x: x if x else ss["lastPrice"]
-            self.data[stock]["last_min"] = ss['lowPrice']  # nullReplace(ss["low"])
-            self.data[stock]["last_max"] = ss['highPrice']  # nullReplace(ss["high"])
-            self.data[stock]["52weekHigh"] = ss['52WkHigh']  # ss['week52High']
-            self.data[stock]["52weekLow"] = ss['52WkLow']  # ss['week52Low']
-
-            self.data[stock]["rSigma"] = {}
-
-            for e in ["low", "high"]:
-                self.data[stock]["rSigma"][e] = sp.cauchy.fit(list(deltas(list(map(np.log, extremes(e)(stock)[::-1])))))
-
+            alias = {'lastPrice': 'current', 'lowPrice': 'last_min', 'highPrice': 'last_max', '52WkHigh': '52weekHigh',
+                     '52WkLow': '52weekLow'}
+            self.data[stock] = {alias[k]: v for k, v in quote(stock).items() if k in alias}
+            self.data[stock]["rSigma"] = { e : sp.cauchy.fit(list(deltas(list(map(np.log, extremes(e)(stock)[::-1]))))) for e in ["low", "high"]}
         return self.data[stock]
 
     @classmethod
@@ -258,8 +246,6 @@ class OrderBook:
         return sum([k.cost() for k in self.OCOorders] + [k[1].cost() for k in self.IndividualOrders._data])
 
     def __str__(self):
-        outDf = pd.DataFrame()
-
         outDf = pd.DataFrame([{"order": str(k), "cost": k.cost(),
                                "wastage": k.wastage()}
                               for k in self.OCOorders])  # [["order","cost","DistanceToTarget","Tseparation","wastage"]]
