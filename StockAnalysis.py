@@ -3,19 +3,19 @@ import numpy as np
 import scipy.stats as sp
 import datetime as dt
 import heapq
-from config import client_id
+import config
 import requests
 from collections import defaultdict
 from IPython.display import display
 from functools import partial
 
 quote = lambda s: requests.get(url=f'https://api.tdameritrade.com/v1/marketdata/{s}/quotes?',
-                               params={'apikey': client_id}).json().get(s, defaultdict(int))
+                               params={'apikey': config.client_id}).json().get(s, defaultdict(int))
 
 extract = lambda d: {k.split(':')[0]: ','.join([i[-2:] == '.0' and i[:-2] or i for i in v.keys()]) for k, v in
                      d.items()}
 chains = lambda s, t: extract(requests.get(url=f'https://api.tdameritrade.com/v1/marketdata/chains',
-                                           params={'apikey': client_id
+                                           params={'apikey': config.client_id
                                                , 'symbol': s
                                                , 'contractType': t
                                                    }).json()[f'{t.lower()}ExpDateMap'])
@@ -23,7 +23,7 @@ chains = lambda s, t: extract(requests.get(url=f'https://api.tdameritrade.com/v1
 history = lambda s: requests.get(
     f"https://api.tdameritrade.com/v1/marketdata/{s}/pricehistory"
     , params={
-        'apikey': client_id
+        'apikey': config.client_id
         , 'periodType': 'year'
         , 'period': 1
         , 'frequencyType': 'daily'
@@ -51,6 +51,23 @@ def backr_suggest(stock, buy, target):
             , map(partial(backr, buy=buy, target=target), (0.5 * _ for _ in range(1, 21)))), None)
         for k, v in chains(stock, 'PUT' if buy == 1 else 'CALL').items()}
 
+
+def account_info(access_token):
+    """ get access token from https://developer.tdameritrade.com/authentication/apis/post/token-0"""
+    header = { "Authorization" : 'Bearer ' + access_token }
+    positions = requests.get(
+        url= f"https://api.tdameritrade.com/v1/accounts/{config.account_id}"
+        , headers=header
+        , params = {'fields': 'positions'}).json()['securitiesAccount']['positions']
+
+    orders = requests.get(
+        url=f"https://api.tdameritrade.com/v1/accounts/{config.account_id}/orders"
+        , headers=header).json()
+
+    transactions = requests.get(
+        url=f"https://api.tdameritrade.com/v1/accounts/{config.account_id}/transactions"
+        , headers=header).json()
+    return positions, orders, transactions
 
 class StockPrices:
     data = {}
