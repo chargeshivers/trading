@@ -35,6 +35,11 @@ deltas = lambda xs: (a - b for a, b in zip(xs, xs[1:]))
 floor = lambda b: lambda x: (x // b) * b
 nearest = lambda b: lambda x: floor(b)(x) + (b if x - floor(b)(x) >= b / 2 else 0)
 
+def near_term_option(stock, buy, target, fee= 0.01):
+    d = chains(stock, 'PUT' if buy==1 else 'CALL')
+    #earliest_date = min(d.keys(), key=dt.datetime.fromisoformat)
+    earliest_date = min(( _ for _ in d.keys() if dt.datetime.fromisoformat(_) >  dt.datetime.today() ), key=dt.datetime.fromisoformat)
+    return earliest_date, sorted([ (k,(k-target)*buy+fee)   for k in       map(float, d[earliest_date].split(',')) if (k-target)*buy > 0 ], key=lambda _:_[1])
 
 def backr(spread, target=None, buy=1, edge=None, disc=0.5, prem=0.05, fee=0.02):
     assert target or edge, "target or edge needs to be specified"
@@ -44,11 +49,28 @@ def backr(spread, target=None, buy=1, edge=None, disc=0.5, prem=0.05, fee=0.02):
     return sorted([z + buy * 2 * spread, z + buy * spread, buy * (z - t), fee + buy * (z - t)], reverse=True)
 
 
-def backr_suggest(stock, buy, target):
+def single(spread,target=None, buy=1, edge=None, disc=0.5, prem=0.05, fee=0.01):
+    assert target or edge, "target or edge needs to be specified"
+    assert buy in [-1, 1], "buy has to be +1 or -1"
+    t = target if target else edge * (1 + disc) ** (-buy)
+    z = nearest(spread)(t * (1 + buy * prem))
+    return sorted([z , buy * (z - t), fee + buy * (z - t)], reverse=True)
+
+
+def single_suggest(stock, buy, target, **kwargs):
+    return {k: next(
+        filter(
+            lambda _: set(_[:1]).issubset(set(map(float, v.split(','))))
+            , map(partial(single, buy=buy, target=target, **kwargs), (0.5 * _ for _ in range(1, 21)))), None)
+        for k, v in chains(stock, 'PUT' if buy == 1 else 'CALL').items()}
+
+
+
+def backr_suggest(stock, buy, target, **kwargs):
     return {k: next(
         filter(
             lambda _: set(_[:2]).issubset(set(map(float, v.split(','))))
-            , map(partial(backr, buy=buy, target=target), (0.5 * _ for _ in range(1, 21)))), None)
+            , map(partial(backr, buy=buy, target=target, **kwargs), (0.5 * _ for _ in range(1, 21)))), None)
         for k, v in chains(stock, 'PUT' if buy == 1 else 'CALL').items()}
 
 
@@ -79,6 +101,7 @@ class StockPrices:
             alias = {'lastPrice': 'current', 'lowPrice': 'last_min', 'highPrice': 'last_max', '52WkHigh': '52weekHigh',
                      '52WkLow': '52weekLow'}
             self.data[stock] = {alias[k]: v for k, v in quote(stock).items() if k in alias}
+            print(f"calculating rSigma for {stock}")
             self.data[stock]["rSigma"] = { e : sp.cauchy.fit(list(deltas(list(map(np.log, extremes(e)(stock)[::-1]))))) for e in ["low", "high"]}
         return self.data[stock]
 
@@ -356,7 +379,36 @@ def newCost(currentCost, sellPrice, numSold, numCurrent):
     numHeld = numCurrent - numSold
     return currentCost - (sellPrice - currentCost) * numSold / numHeld
 
+def value_invest_suggest(wish_list_file):
+    to_buy = pd.read_csv(wish_list_file)
+    to_buy['current'] = to_buy.apply(lambda row : StockPrices.get(row['stock'])['current'] , axis = 1  )
+    to_buy['Xprob'] = to_buy.apply(lambda row : StockPrices.FallBelowProb(row['stock'], row['price']), axis = 1 )
+    to_buy['nto'] = to_buy.apply(lambda r : near_term_option(r['stock'],1,r['price']) , axis =1)
+    return to_buy.sort_values('Xprob', ascending=False)
 
+max_less_than = lambda xs, x : max( [_ for _ in xs if _ <= x], default=0)
+lower_bounds = lambda s, tau : [StockPrices.get(s)['last_min'] * np.exp((StockPrices.get(s)['rSigma']['low'][0]- k*StockPrices.get(s)['rSigma']['low'][1])*tau) for k in [3,2,1]]  
+
+put_price = lambda v : lambda s,e,k : quote(f"{s.replace('.','')}_{dt.datetime.strptime(e, '%Y-%M-%d').strftime('%M%d%y')}P{k}".rstrip('0').rstrip('.')).get(v, -1)
+
+trading_days = lambda t : 1+np.busday_count(dt.datetime.today().date(), t)
+
+def gamble_suggest(target_date,gamble_file):
+    time_to_expiry=1+np.busday_count(dt.datetime.today().date(), target_date)
+    gamble = pd.read_csv(gamble_file,usecols=['stock']).drop_duplicates()
+    gamble['current'] = gamble.apply(lambda row : StockPrices.get(row['stock'])['current'] , axis = 1  )
+    gamble['lower_bounds'] = gamble.apply(lambda r : [max_less_than( map(float,chains(r['stock'], 'PUT').get(target_date,"0").split(',')) ,  k  ) 
+                                                  for k in    lower_bounds(r['stock'], trading_days(target_date)  )], axis=1)
+    gamble['lower_bounds_price'] = gamble.apply(lambda r : [ put_price('mark')(r['stock'],target_date,_) for _ in r['lower_bounds']], axis=1)
+
+    return gamble.sort_values(by = 'lower_bounds_price', ascending = False)
+
+def exit_orders(portfolio):
+    to_sell = pd.DataFrame([ (k.stock, k.target) for k in portfolio.Positions], columns=['stock', 'target'])
+    to_sell['current'] = to_sell.apply(lambda row : StockPrices.get(row['stock'])['current'] , axis = 1 )
+    to_sell['Xprob'] = to_sell.apply(lambda row : StockPrices.RiseAboveProb(row['stock'], row['target']), axis = 1 )
+    to_sell['nto'] = to_sell.apply(lambda r : near_term_option(r['stock'],-1,r['target']) , axis =1)
+    return to_sell.sort_values('Xprob', ascending=False)
 """
             try:
                 df = xf.get_historical_data(stock, end= dt.datetime.today(), start= dt.datetime.today() + dt.timedelta(-365), output_format = "pandas" )
