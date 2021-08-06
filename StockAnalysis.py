@@ -7,6 +7,25 @@ import requests
 from IPython.display import display
 from functools import reduce, lru_cache
 from utility import logg, nearest_to, deltas, retry
+import json
+
+def earnings_date(stock):
+    r= requests.get(f"https://finance.yahoo.com/quote/{stock.replace('.','-')}").text
+    i1=0
+    i1=r.find('root.App.main', i1)
+    i1=r.find('{', i1)
+    i2=r.find("\n", i1)
+    i2=r.rfind(';', i1, i2)
+    jsonstr=r[i1:i2]      
+    data = json.loads(jsonstr)
+    try:
+        return data['context']['dispatcher']['stores']['QuoteSummaryStore']['calendarEvents']['earnings']['earningsDate'][0]['fmt']
+    except:
+        return '2099-12-31'
+
+def is_safe_to_write_put(stock, target_date):
+    ed = earnings_date(stock)
+    return trading_days(ed) < 0 or (trading_days(ed) > trading_days(target_date))  
 
 @retry(5)
 @lru_cache(maxsize=None)
@@ -222,7 +241,7 @@ def get_capital(savings
                 , portfolio_file
                 , target_date
                 , risk_apetite= 1):
-    brokerage_asset = ( lambda d : (vectorize( StockPrices.RiseAboveProb  )( d['stock'], d['target'], trading_days(target_date) )*d["target"]*d["quantity"]).sum() )( pd.read_csv(portfolio_file)  )
+    brokerage_asset = ( lambda d : (vectorize( StockPrices.RiseAboveProb  )( d['stock'], d['cost'], trading_days(target_date) )*d["cost"]*d["quantity"]).sum() )( pd.read_csv(portfolio_file)  )
     funds = savings + brokerage_cash + adjustments + brokerage_asset
     put_obligation = pd.read_csv(put_obligation_file)
     put_obligation['price'] = put_obligation.apply( 
@@ -257,11 +276,16 @@ capital= ${capital:,.0f}
 def gamble_suggest(target_date
                    , gamble_file
                    , exclude_current=True
+                   , exlude_upcoming_earnings= True
                    , exclude = [] 
-                   , min_stocks= 4
+                   , min_stocks= 6
                    , **kwargs):
     if exclude_current:
         exclude += pd.read_csv(kwargs['put_obligation_file'])['stock'].to_list()
+    if exlude_upcoming_earnings:
+        upcoming_earnings = list(filter( lambda _ : not is_safe_to_write_put(_,target_date) , pd.read_csv(gamble_file)['stock'].to_list()))
+        print(f"Earnings upcoming from {','.join(upcoming_earnings)} and therefore excluding.." )
+        exclude += upcoming_earnings
         
     print(f"#trading days = {trading_days(target_date)}")
     capital= get_capital(target_date= target_date, **kwargs)
