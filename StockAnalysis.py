@@ -9,6 +9,8 @@ from functools import reduce, lru_cache
 from utility import logg, nearest_to, deltas, retry
 import json
 
+
+@lru_cache(maxsize=None)
 def earnings_date(stock):
     r= requests.get(f"https://finance.yahoo.com/quote/{stock.replace('.','-')}").text
     i1=0
@@ -23,6 +25,7 @@ def earnings_date(stock):
     except:
         return '2099-12-31'
 
+@lru_cache(maxsize=None)
 def is_safe_to_write_put(stock, target_date):
     ed = earnings_date(stock)
     return trading_days(ed) < 0 or (trading_days(ed) > trading_days(target_date))  
@@ -88,6 +91,33 @@ def history(stock):
 def option_exists(stock, target_date):
     return target_date in [_['expiry'] for _ in chains(stock)['PUT']]
 
+def stock_prices(stock, lookback_window=250):
+    extremes = lambda extremity: lambda stock: [_[extremity] for _ in history(stock)]
+
+    alias = {'lastPrice': 'current', 'lowPrice': 'last_min', 'highPrice': 'last_max', '52WkHigh': '52weekHigh',
+             '52WkLow': '52weekLow'}
+
+    out = {alias[k]: v for k, v in quote(stock).items() if k in alias}
+
+    for main, alt in {'last_min': 'low', 'last_max': 'high'}.items():
+        if out[main] == 0:
+            out[main] = extremes(alt)(stock)[-1]
+    out["rSigma"] = {e: sp.cauchy.fit(list(deltas(list(map(log, extremes(e)(stock)[::-1])))))
+                                  for e in ["low", "high"]}
+
+    return out
+
+def predicted_extreme(stock, extremity, days=1):
+    return stock_prices(stock)[ 'last_min' if extremity=='min' else 'last_max' ] * exp( stock_prices(stock)['rSigma']['low' if extremity=='min' else 'high'][0] * days )
+
+def tail_probability(stock, price, direction, days=1):
+    if direction == 'higher':
+        r, sigma = stock_prices(stock)["rSigma"]["high"]
+        return 1 - sp.cauchy.cdf((- r * days + log(price / stock_prices(stock)["last_max"])) / (sigma*days))
+    else:
+        r, sigma = stock_prices(stock)["rSigma"]["low"]
+        return sp.cauchy.cdf((-r*days + log(price / stock_prices(stock)["last_min"])) / (sigma*days))
+
 class StockPrices:
     data = {}
     tradingDay = int(dt.date.today().strftime('%Y%m%d'))
@@ -108,12 +138,16 @@ class StockPrices:
         return self.data[stock]
 
     @classmethod
-    def PredictedMin(self, stock):
-        return self.get(stock)["last_min"] * exp(self.get(stock)["rSigma"]["low"][0])
-
+    def PredictedMin(self, stock, days=1):
+        r, sigma = self.get(stock)["rSigma"]["low"]
+        #return self.get(stock)["last_min"] * exp(self.get(stock)["rSigma"]["low"][0])
+        return self.get(stock)["last_min"] * exp( r*days )
+    
     @classmethod
-    def PredictedMax(self, stock):
-        return self.get(stock)["last_max"] * exp(self.get(stock)["rSigma"]["high"][0])
+    def PredictedMax(self, stock, days=1):
+        r, sigma = self.get(stock)["rSigma"]["high"]
+        #return self.get(stock)["last_max"] * exp(self.get(stock)["rSigma"]["high"][0])
+        return self.get(stock)["last_max"] * exp( r*days )
 
     @classmethod
     def RiseAboveProb(self, stock, price, days= 1):
@@ -126,10 +160,11 @@ class StockPrices:
         return sp.cauchy.cdf((-r*days + log(price / self.get(stock)["last_min"])) / (sigma*days))
 
 class Order:
-    def __init__(self, stock, price, quantity=0):
+    def __init__(self, stock, price, quantity=0, quality=1):
         self.stock = stock
         self.price = price
         self.quantity = quantity
+        self.quality = quality
 
     def __lt__(self, other):
         return self.price < other.price
@@ -157,9 +192,9 @@ class Order:
             return StockPrices.RiseAboveProb(self.stock, self.price)
 
 class Position(Order):
-    def __init__(self, stock, price, quantity, target):
+    def __init__(self, stock, price, quantity, target, quality):
         self.target = (target if target > 0 else price * 1.5)
-        Order.__init__(self, stock, price, quantity)
+        Order.__init__(self, stock, price, quantity, quality)
 
     def Gain(self):
         return StockPrices.get(self.stock)["current"] / self.price - 1
@@ -169,7 +204,7 @@ class Portfolio:
         if Positions != None:
             self.Positions = Positions
         elif File != None:
-            self.Positions = [Position(r["stock"], r["cost"], r["quantity"], r["target"]) for i, r in
+            self.Positions = [Position(r["stock"], r["cost"], r["quantity"], r["target"], r["quality"]) for i, r in
                               pd.read_csv(File).iterrows()]
         else:
             print("Error")
@@ -219,9 +254,12 @@ class Portfolio:
 
 
 @lru_cache(maxsize=None)
-def strike(stock, days_to_expiry, quality):
-    return StockPrices.get(stock)['last_min'] * exp(
-    (StockPrices.get(stock)['rSigma']['low'][0] - (quality / 2) * StockPrices.get(stock)['rSigma']['low'][1]) * days_to_expiry)
+def strike(stock, days_to_expiry, quality, distance_52weekhigh= 0.3 ):
+    max_strike_allowed = StockPrices.get(stock)['52weekHigh']/(1+distance_52weekhigh)
+    r, sigma = StockPrices.get(stock)["rSigma"]["low"]
+    candidate_strike = StockPrices.get(stock)['last_min'] * exp((r - (quality / 2) * sigma) * days_to_expiry)
+    return min(candidate_strike, max_strike_allowed)
+
 
 @logg
 @lru_cache(maxsize=None)
@@ -241,13 +279,24 @@ def get_capital(savings
                 , portfolio_file
                 , target_date
                 , risk_apetite= 1):
-    brokerage_asset = ( lambda d : (vectorize( StockPrices.RiseAboveProb  )( d['stock'], d['cost'], trading_days(target_date) )*d["cost"]*d["quantity"]).sum() )( pd.read_csv(portfolio_file)  )
+    thresholder = lambda c,  x : x if x >= c else 0
+    brokerage_asset = ( lambda d : ( vectorize(min)(vectorize(thresholder)(  d['cost'] 
+                                                        ,vectorize( StockPrices.PredictedMax  )( d['stock']
+                                                                                                , trading_days(target_date) )
+                                                       ), d['target'] )
+                                *d["quantity"]).sum() 
+                  )( pd.read_csv(portfolio_file) )
+    
     funds = savings + brokerage_cash + adjustments + brokerage_asset
     put_obligation = pd.read_csv(put_obligation_file)
     put_obligation['price'] = put_obligation.apply( 
         lambda row : sum(float(_) for _ in row['price'].split('+')) , axis=1)
+#    put_obligation['ProbITM'] = put_obligation.apply( 
+#        lambda row : StockPrices.FallBelowProb(row['stock'],row['strike'], trading_days(target_date) ) , axis=1)
     put_obligation['ProbITM'] = put_obligation.apply( 
-        lambda row : StockPrices.FallBelowProb(row['stock'],row['strike'], trading_days(target_date) ) , axis=1)
+        lambda row : StockPrices.FallBelowProb(row['stock'],row['strike'], trading_days( row['expiry'] if row['expiry']==row['expiry'] else target_date ) ) , axis=1)
+
+
     put_obligation['current'] = put_obligation.apply(lambda row: StockPrices.get(row['stock'])['current'], axis=1)
     max_exposure = (put_obligation['strike']*put_obligation['num_puts']).sum()*100
     expected_exposure = (put_obligation['strike']*put_obligation['num_puts']*put_obligation['ProbITM']).sum()*100
@@ -264,7 +313,7 @@ def get_capital(savings
 
         }).hide_index())
     print(f"""
-funds= ${funds:,.0f}
+funds= ${savings:,.0f} + ${brokerage_cash:,.0f} + ${brokerage_asset:,.0f} + ${adjustments:,.0f} =   ${funds:,.0f}
 max_exposure= ${max_exposure:,.0f}
 expected_exposure= ${expected_exposure:,.0f}
 risk_aware_exposure= ${risk_aware_exposure:,.0f}
@@ -276,32 +325,35 @@ capital= ${capital:,.0f}
 def gamble_suggest(target_date
                    , gamble_file
                    , exclude_current=True
-                   , exlude_upcoming_earnings= True
+                   , exclude_upcoming_earnings= True
                    , exclude = [] 
                    , min_stocks= 6
                    , **kwargs):
     if exclude_current:
         exclude += pd.read_csv(kwargs['put_obligation_file'])['stock'].to_list()
-    if exlude_upcoming_earnings:
+    if exclude_upcoming_earnings:
         upcoming_earnings = list(filter( lambda _ : not is_safe_to_write_put(_,target_date) , pd.read_csv(gamble_file)['stock'].to_list()))
-        print(f"Earnings upcoming from {','.join(upcoming_earnings)} and therefore excluding.." )
+        print(f"Earnings upcoming from {' , '.join(map(lambda _ : _ + ' on ' + earnings_date(_),  upcoming_earnings))} and therefore excluding.." )
         exclude += upcoming_earnings
         
     print(f"#trading days = {trading_days(target_date)}")
     capital= get_capital(target_date= target_date, **kwargs)
-    gamble = pd.read_csv(gamble_file, usecols=['stock','quality']).drop_duplicates()
+    gamble = pd.read_csv(gamble_file).drop_duplicates()
     gamble = gamble[~gamble['stock'].isin(exclude)]
     gamble = gamble[vectorize(option_exists)( gamble['stock'], target_date )]
     gamble['current'] = gamble.apply(lambda row: StockPrices.get(row['stock'])['current'], axis=1)
+    gamble['ideal_strike'] = gamble.apply(
+        lambda r: strike(r['stock']
+                    , trading_days(target_date)
+                    , r['quality']
+                    , r['distance_52weekhigh'] ), axis=1)
+    
     gamble['strike'] = gamble.apply(
         lambda r: nearest_to(
             list([ _ for _ in chains(r['stock'])['PUT'] if _["expiry"] == target_date ][0]["strikes"].keys())  
-            ,strike(r['stock']
-                         , trading_days(target_date), r['quality'])), axis=1)
+            , r['ideal_strike']), axis=1)
     gamble['price'] = gamble.apply(lambda r: option_price('PUT', r['stock'], target_date, r['strike']), axis=1)
-    
-    gamble['price_efficiency'] = gamble.apply(lambda r: r['price'] / r['strike'] if r['strike'] > 0 else -1,
-                                              axis=1)
+    gamble['price_efficiency'] = gamble.apply(lambda r: (r['price'] - max(r['strike'] - r['ideal_strike'],0)  ) / r['strike'] if r['strike'] > 0 else -1,axis=1)
     gamble = gamble.sort_values(by='price_efficiency', ascending=False).head(min_stocks)
 
     gamble['fund_alloc_prop'] = gamble['price_efficiency'] / gamble['price_efficiency'].sum()
@@ -315,10 +367,11 @@ def gamble_suggest(target_date
     print(f"ROI = {roi_from_weeklys(gamble[['strike', 'price', 'num_puts']].to_records(index=False)):.0%}")
     print(f"Capital utilization = {(gamble['strike'] * gamble['num_puts']).sum() * 100 / capital:.0%}")
 
-    return gamble["current,stock,strike,price,num_puts,revenue,price_efficiency,quality,fund_alloc_prop,fund_alloc".split(',')].sort_values(
+    return gamble["current,stock,strike,price,num_puts,revenue,price_efficiency,quality,fund_alloc_prop,fund_alloc,ideal_strike".split(',')].sort_values(
         by='price_efficiency', ascending=False).style.format(
         {
             "current": "${:,.0f}"
+            , "ideal_strike": "${:,.1f}"
             , "strike": "${:,.1f}"
             , "price": "${:,.2f}"
             , "price_efficiency": "{:.1%}"
