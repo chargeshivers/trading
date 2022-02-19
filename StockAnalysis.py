@@ -143,10 +143,6 @@ def view_portfolio(portfolio_file
 
 @lru_cache(maxsize=None)
 def strike(stock, days_to_expiry, quality, distance_52weekhigh= 0.3 ):
-    #df['current'] = vectorize(lambda _: stock_prices(_)['current'])(df['stock'])
-    #max_strike_allowed = StockPrices.get(stock)['52weekHigh']/(1+distance_52weekhigh)
-    #r, sigma = StockPrices.get(stock)["rSigma"]["low"]
-    #candidate_strike = StockPrices.get(stock)['last_min'] * exp((r - (quality / 2) * sigma) * days_to_expiry)
     max_strike_allowed = stock_prices(stock)['52weekHigh']/(1+distance_52weekhigh)
     r, sigma = stock_prices(stock)["rSigma"]["low"]
     candidate_strike = stock_prices(stock)['last_min'] * exp((r - (quality / 2) * sigma) * days_to_expiry)
@@ -172,7 +168,6 @@ def get_capital(savings
                 , target_date
                 , risk_apetite= 1):
     thresholder = lambda c,  x : x if x >= c else 0
-    #predicted_extreme(stock, extremity, days=1)
     brokerage_asset = ( lambda d : ( vectorize(min)(vectorize(thresholder)(  d['cost']
                                                         ,vectorize( predicted_extreme('max') )( d['stock']
                                                                                                 , trading_days(target_date) )
@@ -191,7 +186,6 @@ def get_capital(savings
             , trading_days( row['expiry'] if row['expiry']==row['expiry'] else target_date )
         ) , axis=1)
 
-    #df['current'] = df.apply(lambda row: StockPrices.get(row['stock'])['current'], axis=1)
     df['current'] = vectorize(lambda _: stock_prices(_)['current'])(df['stock'])
     df['change_from_strike'] = df['current'] /df['strike'] -1
     df['earnings_date'] = vectorize(earnings_date)( df['stock'] )
@@ -237,7 +231,6 @@ def gamble_suggest(target_date
     df = pd.read_csv(gamble_file).drop_duplicates()
     df = df[~df['stock'].isin(exclude)]
     df = df[vectorize(option_exists)( df['stock'], target_date )]
-    #df['current'] = df.apply(lambda row: StockPrices.get(row['stock'])['current'], axis=1)
     df['current'] = vectorize(lambda _: stock_prices(_)['current'])(df['stock'])
     df['ideal_strike'] = df.apply(
         lambda r: strike(r['stock']
