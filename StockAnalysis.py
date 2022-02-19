@@ -106,22 +106,26 @@ def stock_prices(stock, lookback_window=250):
                                   for e in ["low", "high"]}
     return out
 
-def predicted_extreme(stock, extremity, days=1):
-    return stock_prices(stock)[ 'last_min' if extremity=='min' else 'last_max' ] * exp( stock_prices(stock)['rSigma']['low' if extremity=='min' else 'high'][0] * days )
+def predicted_extreme(extremity):
+    def _predicted_extreme(stock, days=1):
+        return stock_prices(stock)[ 'last_min' if extremity=='min' else 'last_max' ] * exp( stock_prices(stock)['rSigma']['low' if extremity=='min' else 'high'][0] * days )
+    return _predicted_extreme
 
-def tail_probability(stock, price, direction, days=1):
-    if direction == 'higher':
-        r, sigma = stock_prices(stock)["rSigma"]["high"]
-        return 1 - sp.cauchy.cdf((- r * days + log(price / stock_prices(stock)["last_max"])) / (sigma*days))
-    else:
-        r, sigma = stock_prices(stock)["rSigma"]["low"]
-        return sp.cauchy.cdf((-r*days + log(price / stock_prices(stock)["last_min"])) / (sigma*days))
+def tail_probability(direction):
+    def _tail_probability(stock, price, days=1):
+        if direction == 'higher':
+            r, sigma = stock_prices(stock)["rSigma"]["high"]
+            return 1 - sp.cauchy.cdf((- r * days + log(price / stock_prices(stock)["last_max"])) / (sigma*days))
+        else:
+            r, sigma = stock_prices(stock)["rSigma"]["low"]
+            return sp.cauchy.cdf((-r*days + log(price / stock_prices(stock)["last_min"])) / (sigma*days))
+    return _tail_probability
 
 def view_portfolio(portfolio_file
                    , sortby="gain"
                    , ascending=False
                    , columns=["stock","concentration", "gain","current"]):
-    df = pd.read_csv('data/myPortfolio.csv')
+    df = pd.read_csv(portfolio_file)
     df["investment"] = df["cost"]*df["quantity"]
     df["concentration"] = df["investment"] / df["investment"].sum()
     df['current'] = vectorize( lambda _ : stock_prices(_)['current'] )( df['stock'] )
@@ -139,9 +143,13 @@ def view_portfolio(portfolio_file
 
 @lru_cache(maxsize=None)
 def strike(stock, days_to_expiry, quality, distance_52weekhigh= 0.3 ):
-    max_strike_allowed = StockPrices.get(stock)['52weekHigh']/(1+distance_52weekhigh)
-    r, sigma = StockPrices.get(stock)["rSigma"]["low"]
-    candidate_strike = StockPrices.get(stock)['last_min'] * exp((r - (quality / 2) * sigma) * days_to_expiry)
+    #df['current'] = vectorize(lambda _: stock_prices(_)['current'])(df['stock'])
+    #max_strike_allowed = StockPrices.get(stock)['52weekHigh']/(1+distance_52weekhigh)
+    #r, sigma = StockPrices.get(stock)["rSigma"]["low"]
+    #candidate_strike = StockPrices.get(stock)['last_min'] * exp((r - (quality / 2) * sigma) * days_to_expiry)
+    max_strike_allowed = stock_prices(stock)['52weekHigh']/(1+distance_52weekhigh)
+    r, sigma = stock_prices(stock)["rSigma"]["low"]
+    candidate_strike = stock_prices(stock)['last_min'] * exp((r - (quality / 2) * sigma) * days_to_expiry)
     return min(candidate_strike, max_strike_allowed)
 
 
@@ -164,8 +172,9 @@ def get_capital(savings
                 , target_date
                 , risk_apetite= 1):
     thresholder = lambda c,  x : x if x >= c else 0
-    brokerage_asset = ( lambda d : ( vectorize(min)(vectorize(thresholder)(  d['cost'] 
-                                                        ,vectorize( StockPrices.PredictedMax  )( d['stock']
+    #predicted_extreme(stock, extremity, days=1)
+    brokerage_asset = ( lambda d : ( vectorize(min)(vectorize(thresholder)(  d['cost']
+                                                        ,vectorize( predicted_extreme('max') )( d['stock']
                                                                                                 , trading_days(target_date) )
                                                        ), d['cost'] )
                                 *d["quantity"]).sum() 
@@ -176,9 +185,14 @@ def get_capital(savings
     df['price'] = df.apply(
         lambda row : sum(float(_) for _ in row['price'].split('+')) , axis=1)
     df['ProbITM'] = df.apply(
-        lambda row : StockPrices.FallBelowProb(row['stock'],row['strike'], trading_days( row['expiry'] if row['expiry']==row['expiry'] else target_date ) ) , axis=1)
+        lambda row : tail_probability('lower')(
+            row['stock']
+            , row['strike']
+            , trading_days( row['expiry'] if row['expiry']==row['expiry'] else target_date )
+        ) , axis=1)
 
-    df['current'] = df.apply(lambda row: StockPrices.get(row['stock'])['current'], axis=1)
+    #df['current'] = df.apply(lambda row: StockPrices.get(row['stock'])['current'], axis=1)
+    df['current'] = vectorize(lambda _: stock_prices(_)['current'])(df['stock'])
     df['change_from_strike'] = df['current'] /df['strike'] -1
     df['earnings_date'] = vectorize(earnings_date)( df['stock'] )
     max_exposure = (df['strike']*df['num_puts']).sum()*100
@@ -223,7 +237,8 @@ def gamble_suggest(target_date
     df = pd.read_csv(gamble_file).drop_duplicates()
     df = df[~df['stock'].isin(exclude)]
     df = df[vectorize(option_exists)( df['stock'], target_date )]
-    df['current'] = df.apply(lambda row: StockPrices.get(row['stock'])['current'], axis=1)
+    #df['current'] = df.apply(lambda row: StockPrices.get(row['stock'])['current'], axis=1)
+    df['current'] = vectorize(lambda _: stock_prices(_)['current'])(df['stock'])
     df['ideal_strike'] = df.apply(
         lambda r: strike(r['stock']
                     , trading_days(target_date)
@@ -262,7 +277,6 @@ def gamble_suggest(target_date
             , 'fund_alloc': "${:,.0f}"
             , "num_puts": "{:,.0f}"
             , "revenue": "${:,.0f}"
-
         }).hide_index()
 
 def exit_aggressive(portfolio_file, exclude_upcoming_earnings= True):
@@ -279,9 +293,8 @@ def exit_aggressive(portfolio_file, exclude_upcoming_earnings= True):
     if not df_curr.empty:
         df_curr['days_to_expiry'] = vectorize( trading_days )( df_curr['call_expiry']  )
     
-        df_curr['ProbITM'] = vectorize(tail_probability)( df_curr['stock']
+        df_curr['ProbITM'] = vectorize(tail_probability('higher'))( df_curr['stock']
                                                      , df_curr['call_strike']
-                                                     , 'higher'
                                                      , df_curr['days_to_expiry'] )
         display(df_curr["stock,quality,last_max,call_expiry,call_strike,call_price,num_calls,ProbITM,earnings_date".split(',')].sort_values(
             by='ProbITM', ascending=False).style.format(
@@ -310,7 +323,7 @@ def exit_aggressive(portfolio_file, exclude_upcoming_earnings= True):
     
     df['price_efficiency'] = df["option_price"]/( df['cost'] - df['strike'] )
     
-    return df["stock,quality,last_max,expiry,strike,option_price,num_calls,price_efficiency,earnings_date".split(',')].sort_values(
+    return df["stock,quality,last_max,cost,expiry,strike,option_price,num_calls,price_efficiency,earnings_date".split(',')].sort_values(
             by='price_efficiency', ascending=False).style.format(
             {
                 "num_calls": "{:,.0f}"
@@ -318,5 +331,6 @@ def exit_aggressive(portfolio_file, exclude_upcoming_earnings= True):
                 , "last_max": "${:,.2f}"
                 , "strike": "${:,.1f}"
                 , "option_price": "${:,.2f}"
+                , "cost": "${:,.2f}"
                 , "price_efficiency": "{:.1%}"
             }).hide_index()
